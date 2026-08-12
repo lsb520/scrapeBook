@@ -36,7 +36,8 @@ MAX_CONCURRENCY = 32
 SAVE_EVERY_COMPLETED_CHAPTERS = 12
 DELETE_CONFIRM_SECONDS = 2.6
 MAX_CHAPTER_PAGES = 30
-READ_CHAIN_SAFETY_LIMIT = 80
+DEFAULT_READ_CHAIN_LIMIT = 80
+MAX_READ_CHAIN_LIMIT = 1000
 CONTENT_SCHEMA_VERSION = 3
 EVENT_DRAIN_LIMIT = 260
 CHAPTER_UI_UPDATES_PER_TICK = 24
@@ -995,10 +996,17 @@ def discover_69shuba_read_chapters_from_html(
     html_text: str,
     final_url: str,
     start_url: str,
+    read_chain_limit: int = DEFAULT_READ_CHAIN_LIMIT,
     progress_callback=None,
 ) -> tuple[str, list[dict[str, str]]] | None:
     if not is_69shuba_read_url(final_url):
         return None
+
+    try:
+        limit = int(read_chain_limit)
+    except (TypeError, ValueError):
+        limit = DEFAULT_READ_CHAIN_LIMIT
+    limit = max(1, min(MAX_READ_CHAIN_LIMIT, limit))
 
     current_html = html_text
     current_url = final_url
@@ -1006,7 +1014,7 @@ def discover_69shuba_read_chapters_from_html(
     chapters: list[dict[str, str]] = []
     book_title = ""
 
-    for index in range(READ_CHAIN_SAFETY_LIMIT):
+    for index in range(limit):
         normalized_url = strip_url_fragment(current_url)
         if normalized_url in visited_urls:
             break
@@ -1036,9 +1044,9 @@ def discover_69shuba_read_chapters_from_html(
             }
         )
         if progress_callback:
-            progress_callback(len(chapters), READ_CHAIN_SAFETY_LIMIT, chapters[-1]["title"])
+            progress_callback(len(chapters), limit, chapters[-1]["title"])
 
-        if len(chapters) >= READ_CHAIN_SAFETY_LIMIT:
+        if len(chapters) >= limit:
             break
         next_url = find_69shuba_next_chapter_url(current_html, current_url, start_url)
         if not next_url or strip_url_fragment(next_url) in visited_urls:
@@ -1075,6 +1083,7 @@ def discover_chapters_from_html(html_text: str, final_url: str, toc_url: str) ->
 def discover_chapters(
     toc_url: str,
     crawl_mode: str = CRAWL_MODE_CATALOG,
+    read_chain_limit: int = DEFAULT_READ_CHAIN_LIMIT,
     progress_callback=None,
 ) -> tuple[str, list[dict[str, str]], str]:
     html_text, final_url = fetch_html(toc_url)
@@ -1083,6 +1092,7 @@ def discover_chapters(
             html_text,
             final_url,
             toc_url,
+            read_chain_limit=read_chain_limit,
             progress_callback=progress_callback,
         )
         if not site_result:
@@ -1517,6 +1527,7 @@ def load_saved_books() -> dict[str, dict]:
             "crawl_mode",
             CRAWL_MODE_READ_CHAIN if is_69shuba_read_url(str(source_url)) else CRAWL_MODE_CATALOG,
         )
+        book.setdefault("read_chain_limit", DEFAULT_READ_CHAIN_LIMIT)
         book.setdefault("chapters", [])
         book["chapters"] = normalize_chapter_dicts(
             list(book.get("chapters", [])),
@@ -1743,6 +1754,8 @@ class NovelScraperApp:
         self.concurrency_var = tk.StringVar(value=str(DEFAULT_CONCURRENCY))
         self.delay_var = tk.StringVar(value=str(REQUEST_DELAY_SECONDS))
         self.crawl_mode_var = tk.StringVar(value=CRAWL_MODE_LABELS[CRAWL_MODE_CATALOG])
+        self.read_chain_limit_var = tk.StringVar(value=str(DEFAULT_READ_CHAIN_LIMIT))
+        self.read_chain_hint_var = tk.StringVar(value="")
 
         self._configure_style()
         self._build_ui()
@@ -1763,6 +1776,7 @@ class NovelScraperApp:
         style.configure("Title.TLabel", background=COLORS["panel"], foreground=COLORS["text_strong"], font=UI_FONT_BOLD)
         style.configure("Muted.TLabel", background=COLORS["root"], foreground=COLORS["muted"], font=UI_FONT)
         style.configure("Toolbar.TLabel", background=COLORS["root"], foreground=COLORS["muted"], font=UI_FONT)
+        style.configure("Warning.TLabel", background=COLORS["root"], foreground=COLORS["warning"], font=UI_FONT)
         style.configure(
             "Dark.TEntry",
             fieldbackground=COLORS["surface"],
@@ -1858,7 +1872,7 @@ class NovelScraperApp:
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(2, weight=1)
+        self.root.rowconfigure(3, weight=1)
 
         toolbar = ttk.Frame(self.root, padding=(10, 8), style="Toolbar.TFrame")
         toolbar.grid(row=0, column=0, sticky=E + W)
@@ -1879,6 +1893,7 @@ class NovelScraperApp:
             font=UI_FONT,
         )
         self.crawl_mode_combo.grid(row=0, column=2, sticky=W, padx=(0, 8))
+        self.crawl_mode_combo.bind("<<ComboboxSelected>>", lambda _event: self._sync_mode_controls())
 
         ttk.Label(toolbar, text="并发", style="Toolbar.TLabel").grid(row=0, column=3, sticky=W, padx=(0, 6))
         self.concurrency_spin = tk.Spinbox(
@@ -1903,14 +1918,49 @@ class NovelScraperApp:
         self.delay_entry = ttk.Entry(toolbar, textvariable=self.delay_var, width=6, style="Dark.TEntry")
         self.delay_entry.grid(row=0, column=6, sticky=W, padx=(0, 8), ipady=2)
 
+        self.read_chain_limit_label = ttk.Label(toolbar, text="章数", style="Toolbar.TLabel")
+        self.read_chain_limit_label.grid(row=0, column=7, sticky=W, padx=(0, 6))
+        self.read_chain_limit_spin = tk.Spinbox(
+            toolbar,
+            from_=1,
+            to=MAX_READ_CHAIN_LIMIT,
+            width=5,
+            textvariable=self.read_chain_limit_var,
+            command=self._update_read_chain_hint,
+            font=UI_FONT,
+            bg=COLORS["surface"],
+            fg=COLORS["text"],
+            disabledbackground=COLORS["surface"],
+            disabledforeground=COLORS["subtle"],
+            insertbackground=COLORS["text"],
+            buttonbackground=COLORS["surface"],
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+            highlightcolor=COLORS["border_focus"],
+        )
+        self.read_chain_limit_spin.grid(row=0, column=8, sticky=W, padx=(0, 8))
+        self.read_chain_limit_var.trace_add("write", lambda *_args: self._update_read_chain_hint())
+
         self.start_button = ttk.Button(toolbar, text="开始爬取", style="Accent.TButton", command=self.start_crawl_from_input)
-        self.start_button.grid(row=0, column=7, padx=(0, 6))
+        self.start_button.grid(row=0, column=9, padx=(0, 6))
 
         self.export_button = ttk.Button(toolbar, text="保存TXT", style="Dark.TButton", command=self.export_txt)
-        self.export_button.grid(row=0, column=8)
+        self.export_button.grid(row=0, column=10)
+
+        hint_row = ttk.Frame(self.root, padding=(10, 0, 10, 2), style="Root.TFrame")
+        hint_row.grid(row=1, column=0, sticky=E + W)
+        hint_row.columnconfigure(0, weight=1)
+        self.read_chain_hint_label = ttk.Label(
+            hint_row,
+            textvariable=self.read_chain_hint_var,
+            style="Warning.TLabel",
+        )
+        self.read_chain_hint_label.grid(row=0, column=0, sticky=W)
+        self._sync_mode_controls()
 
         status_row = ttk.Frame(self.root, padding=(10, 0, 10, 6), style="Root.TFrame")
-        status_row.grid(row=1, column=0, sticky=E + W)
+        status_row.grid(row=2, column=0, sticky=E + W)
         status_row.columnconfigure(0, weight=1)
         self.status_var = tk.StringVar(value="输入小说目录页地址开始爬取；历史小说会保留在左侧书架。")
         ttk.Label(status_row, textvariable=self.status_var, style="Muted.TLabel").grid(row=0, column=0, sticky=W)
@@ -1918,7 +1968,7 @@ class NovelScraperApp:
         self.progress.grid(row=0, column=1, sticky=E, padx=(10, 0))
 
         main = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL, style="Dark.TPanedwindow")
-        main.grid(row=2, column=0, sticky=N + S + E + W, padx=0, pady=0)
+        main.grid(row=3, column=0, sticky=N + S + E + W, padx=0, pady=0)
 
         sidebar = ttk.Frame(main, padding=(10, 8), style="Panel.TFrame")
         sidebar.columnconfigure(0, weight=1)
@@ -2009,17 +2059,18 @@ class NovelScraperApp:
             messagebox.showwarning("地址不正确", "请输入以 http:// 或 https:// 开头的小说目录页或阅读页地址。")
             return
         crawl_mode = CRAWL_MODE_OPTIONS.get(self.crawl_mode_var.get(), CRAWL_MODE_CATALOG)
+        read_chain_limit = self._current_read_chain_limit() if crawl_mode == CRAWL_MODE_READ_CHAIN else DEFAULT_READ_CHAIN_LIMIT
         if crawl_mode == CRAWL_MODE_READ_CHAIN:
             confirmed = messagebox.askyesno(
                 "确认本地保存",
-                f"将从当前阅读页开始，顺着“下一章”最多读取 {READ_CHAIN_SAFETY_LIMIT} 章，"
+                f"将从当前阅读页开始，顺着“下一章”最多读取 {read_chain_limit} 章，"
                 "并保存到本机缓存；之后可由你导出 TXT。\n\n"
                 "请确认你有权保存这些内容，且该操作符合网站规则和你的个人使用范围。",
             )
             if not confirmed:
                 self.status_var.set("已取消。")
                 return
-        self.start_crawl(url, manual=True, crawl_mode=crawl_mode)
+        self.start_crawl(url, manual=True, crawl_mode=crawl_mode, read_chain_limit=read_chain_limit)
 
     def _current_concurrency(self) -> int:
         try:
@@ -2039,12 +2090,38 @@ class NovelScraperApp:
         self.delay_var.set(f"{value:g}")
         return value
 
+    def _current_read_chain_limit(self) -> int:
+        try:
+            value = int(self.read_chain_limit_var.get())
+        except ValueError:
+            value = DEFAULT_READ_CHAIN_LIMIT
+        value = max(1, min(MAX_READ_CHAIN_LIMIT, value))
+        self.read_chain_limit_var.set(str(value))
+        return value
+
+    def _sync_mode_controls(self) -> None:
+        crawl_mode = CRAWL_MODE_OPTIONS.get(self.crawl_mode_var.get(), CRAWL_MODE_CATALOG)
+        state = "normal" if crawl_mode == CRAWL_MODE_READ_CHAIN else "disabled"
+        self.read_chain_limit_spin.configure(state=state)
+        self._update_read_chain_hint()
+
+    def _update_read_chain_hint(self) -> None:
+        crawl_mode = CRAWL_MODE_OPTIONS.get(self.crawl_mode_var.get(), CRAWL_MODE_CATALOG)
+        if crawl_mode != CRAWL_MODE_READ_CHAIN:
+            self.read_chain_hint_var.set("")
+            return
+        raw_value = self.read_chain_limit_var.get().strip() or str(DEFAULT_READ_CHAIN_LIMIT)
+        self.read_chain_hint_var.set(
+            f"提示：阅读页连续模式会从当前章节开始顺着“下一章”爬取，达到设定章数 {raw_value} 章后停止；开始前请确认章数是否足够。"
+        )
+
     def start_crawl(
         self,
         url: str,
         manual: bool = False,
         book_id: str | None = None,
         crawl_mode: str | None = None,
+        read_chain_limit: int | None = None,
     ) -> None:
         if self.worker and self.worker.is_alive():
             self.status_var.set("已有爬取任务正在进行，请等待当前任务完成。")
@@ -2057,9 +2134,10 @@ class NovelScraperApp:
         concurrency = self._current_concurrency()
         request_delay = self._current_request_delay()
         crawl_mode = crawl_mode or CRAWL_MODE_OPTIONS.get(self.crawl_mode_var.get(), CRAWL_MODE_CATALOG)
+        read_chain_limit = read_chain_limit or self._current_read_chain_limit()
         self.worker = threading.Thread(
             target=self._crawl_worker,
-            args=(url, book_id, concurrency, request_delay, crawl_mode),
+            args=(url, book_id, concurrency, request_delay, crawl_mode, read_chain_limit),
             daemon=True,
         )
         self.worker.start()
@@ -2071,6 +2149,7 @@ class NovelScraperApp:
         concurrency: int,
         request_delay: float,
         crawl_mode: str,
+        read_chain_limit: int,
     ) -> None:
         try:
             self._post("status", text="正在分析页面……")
@@ -2081,6 +2160,7 @@ class NovelScraperApp:
             title, chapters, final_url = discover_chapters(
                 url,
                 crawl_mode=crawl_mode,
+                read_chain_limit=read_chain_limit,
                 progress_callback=discovery_progress,
             )
             source_url = url
@@ -2096,6 +2176,7 @@ class NovelScraperApp:
                 "updated_at": now_iso(),
                 "completed": False,
                 "crawl_mode": crawl_mode,
+                "read_chain_limit": read_chain_limit if crawl_mode == CRAWL_MODE_READ_CHAIN else None,
                 "chapters": chapters,
             }
             if existing and existing.get("_files"):
@@ -2594,6 +2675,8 @@ class NovelScraperApp:
         self.active_book_id = book_id
         self.url_var.set(book.get("source_url", ""))
         self.crawl_mode_var.set(CRAWL_MODE_LABELS.get(book.get("crawl_mode"), CRAWL_MODE_LABELS[CRAWL_MODE_CATALOG]))
+        self.read_chain_limit_var.set(str(book.get("read_chain_limit") or DEFAULT_READ_CHAIN_LIMIT))
+        self._sync_mode_controls()
         if book_id not in self.refreshed_on_open:
             self.refreshed_on_open.add(book_id)
             self.status_var.set(f"正在按历史地址刷新：{book.get('title', '')}")
@@ -2602,6 +2685,7 @@ class NovelScraperApp:
                 manual=False,
                 book_id=book_id,
                 crawl_mode=book.get("crawl_mode", CRAWL_MODE_CATALOG),
+                read_chain_limit=int(book.get("read_chain_limit") or DEFAULT_READ_CHAIN_LIMIT),
             )
 
     def on_tree_select(self, _event: tk.Event) -> None:
@@ -2621,6 +2705,8 @@ class NovelScraperApp:
                 self.crawl_mode_var.set(
                     CRAWL_MODE_LABELS.get(book.get("crawl_mode"), CRAWL_MODE_LABELS[CRAWL_MODE_CATALOG])
                 )
+                self.read_chain_limit_var.set(str(book.get("read_chain_limit") or DEFAULT_READ_CHAIN_LIMIT))
+                self._sync_mode_controls()
                 self._set_content(self._book_summary(book))
         elif ref[0] == "chapter":
             _kind, book_id, index = ref
@@ -2631,10 +2717,16 @@ class NovelScraperApp:
     def _book_summary(self, book: dict) -> str:
         chapters = book.get("chapters", [])
         done = len([chapter for chapter in chapters if chapter_has_usable_content(chapter)])
+        mode = book.get("crawl_mode")
+        mode_text = CRAWL_MODE_LABELS.get(mode, CRAWL_MODE_LABELS[CRAWL_MODE_CATALOG])
+        limit_text = ""
+        if mode == CRAWL_MODE_READ_CHAIN:
+            limit_text = f"连续章数：{book.get('read_chain_limit') or DEFAULT_READ_CHAIN_LIMIT}\n"
         return (
             f"{book.get('title', '未命名小说')}\n\n"
             f"目录地址：{book.get('source_url', '')}\n"
-            f"爬取模式：{CRAWL_MODE_LABELS.get(book.get('crawl_mode'), CRAWL_MODE_LABELS[CRAWL_MODE_CATALOG])}\n"
+            f"爬取模式：{mode_text}\n"
+            f"{limit_text}"
             f"章节数量：{len(chapters)}\n"
             f"已获取正文：{done}\n"
             f"更新时间：{book.get('updated_at', '')}\n\n"
@@ -2755,6 +2847,7 @@ class NovelScraperApp:
                     manual=False,
                     book_id=book["id"],
                     crawl_mode=book.get("crawl_mode", CRAWL_MODE_CATALOG),
+                    read_chain_limit=int(book.get("read_chain_limit") or DEFAULT_READ_CHAIN_LIMIT),
                 )
             return
 
